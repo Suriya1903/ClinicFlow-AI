@@ -1,0 +1,283 @@
+name: ClinicFlow AI CI
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+
+jobs:
+
+  # ========================================================
+  # Backend Tests
+  # ========================================================
+
+  backend-tests:
+    name: Backend Tests
+
+    runs-on: ubuntu-latest
+
+    services:
+
+      postgres:
+        image: pgvector/pgvector:pg18
+
+        env:
+          POSTGRES_DB: clinicflow_db
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+
+        ports:
+          - 5432:5432
+
+        options: >-
+          --health-cmd "pg_isready -U postgres -d clinicflow_db"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      redis:
+        image: redis:7-alpine
+
+        ports:
+          - 6379:6379
+
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+
+      - name: Install backend dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+
+      - name: Run database migrations
+        env:
+          DATABASE_URL: postgresql+psycopg://postgres:postgres@localhost:5432/clinicflow_db
+          JWT_SECRET_KEY: clinicflow-ci-secret
+          JWT_ALGORITHM: HS256
+          JWT_ACCESS_TOKEN_EXPIRE_MINUTES: 30
+          REDIS_URL: redis://localhost:6379/0
+          OLLAMA_BASE_URL: http://127.0.0.1:11434
+          OLLAMA_MODEL: qwen3:4b
+          EMBEDDING_MODEL: nomic-embed-text
+          MCP_SERVER_URL: http://127.0.0.1:8001/mcp
+        run: |
+          alembic upgrade head
+
+
+      - name: Load deterministic CI seed data
+        env:
+          PGHOST: localhost
+          PGPORT: 5432
+          PGDATABASE: clinicflow_db
+          PGUSER: postgres
+          PGPASSWORD: postgres
+        run: |
+          psql -v ON_ERROR_STOP=1 -f tests/ci_seed.sql
+
+
+      - name: Start MCP server
+        env:
+          DATABASE_URL: postgresql+psycopg://postgres:postgres@localhost:5432/clinicflow_db
+          JWT_SECRET_KEY: clinicflow-ci-secret
+          JWT_ALGORITHM: HS256
+          JWT_ACCESS_TOKEN_EXPIRE_MINUTES: 30
+          REDIS_URL: redis://localhost:6379/0
+          OLLAMA_BASE_URL: http://127.0.0.1:11434
+          OLLAMA_MODEL: qwen3:4b
+          EMBEDDING_MODEL: nomic-embed-text
+          MCP_SERVER_URL: http://127.0.0.1:8001/mcp
+        run: |
+          nohup uvicorn mcp_server.http_server:app \
+            --host 127.0.0.1 \
+            --port 8001 \
+            > /tmp/clinicflow-mcp.log 2>&1 &
+
+
+      - name: Wait for MCP server
+        run: |
+          python - <<'PY'
+          import socket
+          import time
+
+          for attempt in range(30):
+              try:
+                  with socket.create_connection(
+                      ("127.0.0.1", 8001),
+                      timeout=1,
+                  ):
+                      print("MCP server is ready.")
+                      break
+              except OSError:
+                  if attempt == 29:
+                      print("MCP server log:")
+                      try:
+                          print(
+                              open(
+                                  "/tmp/clinicflow-mcp.log",
+                                  encoding="utf-8",
+                              ).read()
+                          )
+                      except Exception:
+                          pass
+                      raise SystemExit(
+                          "MCP server did not start within 30 seconds."
+                      )
+
+                  time.sleep(1)
+          PY
+
+
+      - name: Run pytest
+        env:
+          DATABASE_URL: postgresql+psycopg://postgres:postgres@localhost:5432/clinicflow_db
+          JWT_SECRET_KEY: clinicflow-ci-secret
+          JWT_ALGORITHM: HS256
+          JWT_ACCESS_TOKEN_EXPIRE_MINUTES: 30
+          REDIS_URL: redis://localhost:6379/0
+          OLLAMA_BASE_URL: http://127.0.0.1:11434
+          OLLAMA_MODEL: qwen3:4b
+          EMBEDDING_MODEL: nomic-embed-text
+          MCP_SERVER_URL: http://127.0.0.1:8001/mcp
+        run: |
+          pytest -q
+
+
+      - name: Upload MCP server log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: clinicflow-mcp-log
+          path: /tmp/clinicflow-mcp.log
+
+
+  # ========================================================
+  # Frontend Build
+  # ========================================================
+
+  frontend-build:
+    name: Frontend Build
+
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+
+      - name: Build frontend
+        working-directory: frontend
+        run: npm run build
+
+
+  # ========================================================
+  # Backend Docker Build
+  # ========================================================
+
+  backend-docker-build:
+    name: Backend Docker Build
+
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+
+      - name: Build backend Docker image
+        run: |
+          docker build \
+            -t clinicflow-backend:ci \
+            -f backend/Dockerfile \
+            .
+
+
+  # ========================================================
+  # MCP Docker Build
+  # ========================================================
+
+  mcp-docker-build:
+    name: MCP Docker Build
+
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+
+      - name: Build MCP Docker image
+        run: |
+          docker build \
+            -t clinicflow-mcp:ci \
+            -f mcp_server/Dockerfile \
+            .
+
+
+  # ========================================================
+  # Frontend Docker Build
+  # ========================================================
+
+  frontend-docker-build:
+    name: Frontend Docker Build
+
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+
+      - name: Build frontend Docker image
+        run: |
+          docker build \
+            -t clinicflow-frontend:ci \
+            -f frontend/Dockerfile \
+            .
